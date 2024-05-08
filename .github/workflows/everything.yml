@@ -1,0 +1,130 @@
+name: everything
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Create or Destroy'
+        required: true
+        default: 'update'
+
+env:
+  TERRAFORM_STATE_BRANCH: "gh-pages"
+  FOLDER_FOR_TF: "my_tf_state"
+
+jobs:
+  terraform_action:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v2
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+
+    - name: Set Git Identity
+      run: |
+        git config --global user.email "actions@github.com"
+        git config --global user.name "GitHub Actions"
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        terraform_version: 0.15.0
+        token: ${{ secrets.PAT_TOKEN }}
+        
+    - name: Authorise pipeline for a raw create
+      env:
+        AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      if: ${{ (github.event.inputs.action == 'create' || github.event.inputs.action == 'destroy' || github.event.inputs.action == 'update') && github.event_name == 'workflow_dispatch' }}
+      run:  |
+        az login --tenant "$AZURE_TENANT_ID" --use-device-code
+        # Print the build number
+        echo "Build Number: $GITHUB_RUN_NUMBER"
+
+    - name: Retrieve last terraform state
+      #working-directory: terraform/azure
+      if: ${{ (github.event.inputs.action == 'create' || github.event.inputs.action == 'destroy' || github.event.inputs.action == 'update' || github.event.inputs.action == 'waka') && github.event_name == 'workflow_dispatch' }}
+      run: |
+        {
+          git fetch origin ${TERRAFORM_STATE_BRANCH}:${TERRAFORM_STATE_BRANCH}
+          git --work-tree=terraform/azure checkout ${TERRAFORM_STATE_BRANCH} -- .
+        } || {
+          echo "Failed to fetch branch. but no worries.... i will continue. This is optional"
+          echo "This indicates you are requesting a fresh setup. If not so, revisit the code"
+        }
+        
+    - name: Re-apply terraform
+      working-directory: terraform/azure
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        MY_TOKEN: ${{ secrets.PAT_TOKEN }}
+      if:  ${{ github.event.inputs.action == 'update' && github.event_name == 'workflow_dispatch' }}
+      run: |
+        terraform init -upgrade=true
+        terraform plan -var="subscription_id=${AZURE_SUBSCRIPTION_ID}" -var="Github_token_from_pipeline=${MY_TOKEN}"
+        terraform apply -auto-approve -var="subscription_id=$AZURE_SUBSCRIPTION_ID" -var="Github_token_from_pipeline=$MY_TOKEN" -no-color
+        
+    - name: Create SP using terraform
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        MY_TOKEN: ${{ secrets.PAT_TOKEN }}
+      if:  ${{ github.event.inputs.action == 'create' && github.event_name == 'workflow_dispatch' }}
+      working-directory: terraform/azure
+      run: |
+        {
+          terraform init -upgrade=true
+          terraform plan -var="subscription_id=${AZURE_SUBSCRIPTION_ID}" -var="Github_token_from_pipeline=${MY_TOKEN}" 
+          terraform apply -auto-approve -var="subscription_id=$AZURE_SUBSCRIPTION_ID" -var="Github_token_from_pipeline=$MY_TOKEN" -no-color
+          # Save the Terraform output to a file
+          terraform output -json > terraform_output.json
+          echo "after applying ... dont be afraid"
+        } || {
+          echo "Creation failed completely/partially, but I am still proceeding with other steps in this pipeline"
+        }
+
+    - name: Copy tf state to a folder for recording purpose
+      if:  ${{ (github.event.inputs.action == 'create'  || github.event.inputs.action == 'update') && github.event_name == 'workflow_dispatch' }}
+      working-directory: terraform/azure
+      run: |
+        mkdir ${{ env.FOLDER_FOR_TF }}
+        cp terraform.tfstate ${{ env.FOLDER_FOR_TF }}
+        cp terraform_output.json ${{ env.FOLDER_FOR_TF }}
+        
+    - name: Store terraform state in a branch
+      uses: JamesIves/github-pages-deploy-action@4.1.4
+      if:  ${{ (github.event.inputs.action == 'create'  || github.event.inputs.action == 'update') && github.event_name == 'workflow_dispatch' }}
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+        BRANCH: ${{ env.TERRAFORM_STATE_BRANCH }}
+        FOLDER: terraform/azure/${{ env.FOLDER_FOR_TF }}
+        commit-message: "Built with # ${{ github.run_number }}"
+
+    # - name: Update sercret tokens of github with the infra details.
+    #   env:
+    #     AZURE_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+    #   #if:  ${{ github.event.inputs.action == 'create' && github.event_name == 'workflow_dispatch' }}
+    #   if:  ${{ github.event.inputs.action == 'update' && github.event_name == 'workflow_dispatch' }}
+    #   run: |
+    #     # Retrieve service principal details
+    #     sp_details=$(az ad sp list --display-name "$servicePrincipalName")
+    #     echo "Service Principal Details: $sp_details"
+
+        
+      
+    - name: Destroy SP using terraform
+      env:
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        MY_TOKEN: ${{ secrets.PAT_TOKEN }}
+      if:  ${{ github.event.inputs.action == 'destroy' && github.event_name == 'workflow_dispatch' }}
+      working-directory: terraform/azure
+      run: |
+        ls -l
+        terraform init -upgrade=true
+        terraform destroy -auto-approve -var="subscription_id=$AZURE_SUBSCRIPTION_ID" -var="Github_token_from_pipeline=$MY_TOKEN"  -no-color
+        # Switch to a different branch so I can delete ...
+        #git checkout develop
+        git branch -D ${TERRAFORM_STATE_BRANCH}
+        git push origin --delete ${TERRAFORM_STATE_BRANCH}
+
+          
